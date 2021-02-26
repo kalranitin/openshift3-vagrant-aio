@@ -1,0 +1,4 @@
+---
+docker_version: 1.13.1
+deploy_user: vagrant
+

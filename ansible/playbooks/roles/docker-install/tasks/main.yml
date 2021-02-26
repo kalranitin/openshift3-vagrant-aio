@@ -1,0 +1,81 @@
+---
+#- name: "Install appropriate version of Docker"
+#  yum: name=docker-{{ docker_version }} state=present
+#  become: yes
+
+#- name: "Install docker helper packages"
+#  yum: name={{item}} state=present
+#  with_items:
+#    - atomic
+#    - skopeo
+#  become: yes
+
+- name: Install a list of packages
+  yum:
+    name:
+      - docker-{{ docker_version }}
+      - atomic
+      - skopeo
+    state: present
+
+- name: "Configure docker storage setup with STORAGE_DRIVER=overlay2"
+  lineinfile: dest=/etc/sysconfig/docker-storage-setup regexp=^STORAGE_DRIVER= line=STORAGE_DRIVER=overlay2
+  become: yes
+
+- name: "Configure docker storage setup with CONTAINER_ROOT_LV_NAME=dockerlv"
+  lineinfile: dest=/etc/sysconfig/docker-storage-setup regexp=^CONTAINER_ROOT_LV_NAME= line=CONTAINER_ROOT_LV_NAME=dockerlv
+  become: yes
+
+- name: "Configure docker storage setup with CONTAINER_ROOT_LV_SIZE=100%FREE"
+  lineinfile: dest=/etc/sysconfig/docker-storage-setup regexp=^CONTAINER_ROOT_LV_SIZE= line=CONTAINER_ROOT_LV_SIZE=100%FREE
+  become: yes
+
+- name: "Configure docker storage setup with CONTAINER_ROOT_LV_MOUNT_PATH=/var/lib/docker"
+  lineinfile: dest=/etc/sysconfig/docker-storage-setup regexp=^CONTAINER_ROOT_LV_MOUNT_PATH= line=CONTAINER_ROOT_LV_MOUNT_PATH=/var/lib/docker
+  become: yes
+
+- name: "Configure docker storage setup with VG=dockervg"
+  lineinfile: dest=/etc/sysconfig/docker-storage-setup regexp=^VG= line=VG=dockervg
+  become: yes
+
+#- name: "Configure docker storage setup with DEVS= (set in cloud-init)"
+#  lineinfile: dest=/etc/sysconfig/docker-storage-setup regexp=^DEVS= line=DEVS=...
+#  become: yes
+
+- name: "Run container-storage-setup"
+  shell: container-storage-setup
+  become: yes
+  ignore_errors: yes
+
+- name: "Create docker group for non-privileged users"
+  group: name=docker state=present
+  become: yes
+  
+- name: "Add deploy user to the docker group"
+  user: name={{ deploy_user }} groups=docker append=true
+  become: yes
+
+# Use dictionary format for lineinfile when using literal backslashes
+# Bug in ansible - https://github.com/ansible/ansible/issues/10464
+# CIS_Docker_1.12.0 Benchmark - 2.7 - set default ulimit
+- name: 'CIS_Docker_1.12.0 Benchmark - 2.7 Set default ulimit as appropriate for docker daemon'
+  lineinfile:
+    dest: /usr/lib/systemd/system/docker.service
+    line: "          --default-ulimit nofile=250000:250000 \\"
+    state: present
+    insertafter: 'ExecStart=.*'
+  become: yes
+
+- name: reload daemon
+  shell: systemctl daemon-reload
+  become: yes
+
+- name: "Start docker"
+  service: name=docker state=started enabled=yes
+  become: yes
+  register: result
+  until: result is succeeded
+  retries: 5
+  delay: 10
+# We see cases where docker fails to start immediately after boot, so retry
+

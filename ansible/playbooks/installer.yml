@@ -1,0 +1,29 @@
+---
+- hosts: all
+  become: yes
+
+  vars:
+    package_version: "{{ release | replace('v', '') }}"
+    package: openshift-ansible
+    package_with_version: "{{ 'openshift-ansible-' ~ package_version ~ '*' }}"
+
+  tasks:
+
+    - name: Openshift Ansible installer
+      yum:
+        name: "{{ package if deployment_type == 'openshift-enterprise' 
+                    else package_with_version }}"
+        state: present
+
+    - name: Inventory
+      template:
+        src: "../templates/all-in-one.ini"
+        dest: /etc/ansible/hosts
+
+    - name: hosts
+      copy:
+        content: |
+          {{ machine_ip }}  {{ ansible_fqdn }}
+          127.0.0.1   localhost localhost.localdomain localhost4 localhost4.localdomain4
+          ::1         localhost localhost.localdomain localhost6 localhost6.localdomain6
+        dest: /etc/hosts

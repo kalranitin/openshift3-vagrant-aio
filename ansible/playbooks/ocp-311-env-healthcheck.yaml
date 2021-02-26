@@ -1,0 +1,285 @@
+- hosts: localhost
+  gather_facts: no
+  vars_prompt:
+    - name: "ocp_username"
+      prompt: Enter your username
+      default: "developer"
+
+    - name: "ocp_password"
+      prompt: Enter your password"
+      private: yes
+      default: "developer"
+
+  pre_tasks:
+    - name: Check if logged in through CLI
+      shell: command oc whoami
+      register: userName
+      run_once: true
+      failed_when: >
+        "system:anonymous" in userName.stdout
+      changed_when: false
+
+    - name: get master api
+      shell: oc whoami --show-server
+      register: masterapi
+      changed_when: false
+
+    - set_fact:
+        master_api: "{{ masterapi.stdout }}"
+
+    - name: gather etcd nodes
+      set_fact:
+        etcd_nodes: "{{ groups['etcd'] | list }}"
+
+    - name: get length of the list of etcd nodes
+      set_fact:
+        membercount: "{{ etcd_nodes | length }}"
+
+
+  tasks:
+    - name: Get User token to make API calls
+      uri:
+        url: "{{ master_api }}/oauth/authorize?response_type=token&client_id=openshift-challenging-client"
+        force_basic_auth: yes
+        user: "{{ ocp_username }}"
+        password: "{{ ocp_password }}"
+        headers:
+          X-Csrf-Token: 1
+        return_content: yes
+        validate_certs: no
+      register: tokenresponse
+
+    - name: Extract retrieved token
+      local_action: shell echo {{ tokenresponse }} | grep -oP "access_token=\K[^&]*"
+      register: extractedtoken
+      changed_when: false
+
+    - set_fact:
+        ocp_token: "{{ extractedtoken.stdout }}"
+
+# Check Etcd health
+    - name: Get the list of Etcd members
+      local_action: shell oc get cs | grep etcd | awk '{print $1}'
+      register: oc_output
+      changed_when: false
+    - set_fact:
+        etcd_members: "{{ oc_output.stdout.split('\n')|list }}"
+
+    - name: Check etcd member health
+      command: >
+        curl -kv
+        -H "Authorization: Bearer {{ ocp_token }}"
+        {{ master_api }}/api/v1/componentstatuses/{{ item }}
+      with_items:
+        - "{{ etcd_members }}"
+      register: etcdcheck
+      failed_when:
+        - '"Healthy" not in etcdcheck.stdout'
+      changed_when: false
+      args:
+        warn: no
+
+# Check Controller Manager Health
+    - name: Check Controller Manager health
+      command: >
+        curl -kv
+        -H "Authorization: Bearer {{ ocp_token }}"
+        {{ master_api }}/api/v1/componentstatuses/controller-manager
+      register: cm_manager_check
+      failed_when:
+        - '"Healthy" not in cm_manager_check.stdout'
+      changed_when: false
+      args:
+        warn: no
+      ignore_errors: true
+
+# Check Scheduler Health
+    - name: Check Scheduler health
+      command: >
+        curl -kv
+        -H "Authorization: Bearer {{ ocp_token }}"
+        {{ master_api }}/api/v1/componentstatuses/scheduler
+      register: scheduler_check
+      failed_when:
+        - '"Healthy" not in scheduler_check.stdout'
+      changed_when: false
+      args:
+        warn: no
+      ignore_errors: true
+
+
+# Check router and registry in the default project
+    - name: Check status of default project
+      command: oc get dc/router -n default -o jsonpath='{.status.availableReplicas}'
+      run_once: true
+      delegate_to: localhost
+      register: router_replicas_available
+      changed_when: false
+      failed_when: "router_replicas_available.stdout == 0"
+
+    - name: Check status of default project
+      command: oc get dc/router -n default -o jsonpath='{.status.availableReplicas}'
+      run_once: true
+      delegate_to: localhost
+      register: registry_replicas_available
+      changed_when: false
+      failed_when: "registry_replicas_available.stdout == 0"
+
+# Check API endpoints
+    - name: Check OCP Master API
+      uri:
+        url: "{{ master_api }}/healthz"
+        method: GET
+        return_content: yes
+        headers:
+          Authorization: "Bearer {{ ocp_token }}"
+        validate_certs: no
+      register: return_msg
+      changed_when: false
+      failed_when: "'OK' not in return_msg.msg"
+
+    - name: Check registry API
+      uri:
+        url: http://docker-registry.default.svc.cluster.local:5000/healthz
+        method: GET
+        return_content: yes
+      register: return_msg
+      run_once: true
+      changed_when: false
+      failed_when: '"OK" not in return_msg.msg'
+
+    - name: Check service address of docker registry
+      shell: dig +short docker-registry.default.svc.cluster.local
+      register: digoutput
+      changed_when: false
+
+    - name: Check if ClusterIP is same as registry end point
+      shell: oc get svc/docker-registry -n default --no-headers | awk '{print$3}'
+      register: reg_ip_output
+      changed_when: false
+      failed_when: digoutput.stdout != reg_ip_output.stdout
+
+- hosts: masters
+  gather_facts: no
+  tasks:
+    - name: Get serviceNetworkCIDR
+      shell: cat /etc/origin/master/master-config.yaml | grep -i serviceNetworkCIDR | awk '{print$2}' | tail -1
+      register: serviceNetworkCIDR
+      changed_when: false
+    - debug: msg={{ serviceNetworkCIDR.stdout }}
+
+# Check ports on master nodes
+    - name: check if ports are open on masters
+      wait_for:
+        port: "{{ item }}"
+        delay: 5
+        timeout: 10
+        msg: "Timeout waiting for {{ item }} to respond"
+      register: port_check
+      ignore_errors: true
+      with_items:
+        - 53
+        - 22
+        - 8443
+
+
+- hosts: nodes
+  gather_facts: no
+  tasks:
+
+    - name: check if ports are open on nodes
+      wait_for:
+        port: "{{ item }}"
+        delay: 5
+        timeout: 10
+        msg: "Timeout waiting for {{ item }} to respond"
+      register: port_check
+      ignore_errors: true
+      with_items:
+        - 53
+        - 22
+        - 10250
+
+    - name: Check Node Service
+      command: systemctl is-active atomic-openshift-node
+      register: is_active
+      changed_when: false
+      failed_when: "'active' != is_active.stdout"
+
+    - name: Check IP forwarding
+      command: sysctl net.ipv4.ip_forward
+      changed_when: false
+
+    - name: Check openvswitch config
+      command: ovs-vsctl list-br
+      register: ovsoutput
+      changed_when: false
+      failed_when: '"br0" not in ovsoutput.stdout'
+
+    - name: Check MTU of br0 interface
+      shell: ifconfig br0 | grep mtu | awk '{print$4}'
+      ignore_errors: True
+      changed_when: false
+      register: br0_mtu
+
+    - name: Check MTU in node-config
+      shell: "grep -rn --include=*.yaml \"mtu\" /etc/origin/node/node-config.yaml | awk '{print$3}'"
+      register: node_mtu
+      changed_when: false
+      failed_when: br0_mtu.stdout < node_mtu.stdout
+
+    - name: Check Overcommit memory
+      command: sysctl vm.overcommit_memory
+      register: vm_overcommit_memory
+      changed_when: false
+      failed_when: "'vm.overcommit_memory = 1' not in vm_overcommit_memory.stdout"
+
+    - name: Check vm.panic_on_oom
+      command: sysctl vm.panic_on_oom
+      register: vm_panic_on_oom
+      changed_when: false
+      failed_when: "'vm.panic_on_oom = 0' not in vm_panic_on_oom.stdout"
+
+    - name: Check swap memory
+      shell: free | grep Swap | awk '{print$2}' | tail -1
+      register: swap
+      changed_when: false
+      failed_when: "swap.stdout != '0'"
+
+    - name: Check SELinux
+      command: getenforce
+      register: getenforce
+      changed_when: false
+      failed_when: "'Enforcing' not in getenforce.stdout"
+
+    - name: Check SELinux Config
+      command: cat /etc/sysconfig/selinux
+      register: selinux_config
+      changed_when: false
+      failed_when: "'SELINUX=enforcing' not in selinux_config.stdout"
+
+    - name: Check Docker Storage driver
+      shell: docker info | egrep -i 'storage|pool|space|filesystem'
+      register: docker_info
+      ignore_errors: True
+      changed_when: false
+      failed_when: "'devicemapper' not in docker_info.stdout"
+
+    - name: Check Docker Storage setup
+      command: cat /etc/sysconfig/docker-storage-setup
+      register: docker_storage_setup
+      changed_when: false
+      failed_when: "'DEVS=/dev/sdb' not in docker_storage_setup.stdout"
+
+    - name: Check docker storage
+      shell: lvs | grep docker-pool | awk '{print$5}'
+      register: dockerstorage
+      changed_when: false
+    - debug:
+        msg: "{{ dockerstorage.stdout }}"
+
+    - name: Check Worker Node Storage
+      shell: df -h /var/lib/origin/ | tail -1 | awk '{print$5}'
+      register: shell
+      changed_when: false
+    - debug:  msg={{ shell.stdout  }}

@@ -1,0 +1,45 @@
+---
+- hosts: all
+  become: yes
+
+  vars:
+    requirements:
+      - wget
+      - git
+      - net-tools
+      - bind-utils
+      - yum-utils
+      - iptables-services
+      - bridge-utils
+      - bash-completion
+      - kexec-tools
+      - sos
+      - psacct
+
+  tasks:
+
+    - name: Requirements
+      yum:
+        name: "{{ requirements | join(',') }}"
+        state: present
+
+    - name: Ansible package
+      yum:
+        name: centos-release-ansible26
+        state: present
+
+    - name: OpenShift Origin package
+      yum:
+        name: centos-release-openshift-origin
+        state: present
+
+    - name: Openshift installer
+      yum:
+        name: openshift-ansible
+        state: present
+
+    - name: System upgrade
+      yum: name=* state=latest update_cache=yes
+
+  roles:
+    - docker-install
